@@ -80,6 +80,9 @@ DEFAULT_DATA = {
     "notes": [],                # ["متن یادداشت", ...]
     "saved": {},                 # {"برچسب": "متن پیام"}
     "countdowns": [],           # [{"title":..., "date":"YYYY-MM-DD"}]
+    "tone": "formal",           # "formal" یا "casual"
+    "polls": {},                 # {poll_id: {...}}
+    "auto_chat_groups": {},      # {group_guid: {"enabled": bool, "last_reply": ts}}
 }
 
 
@@ -113,7 +116,28 @@ if OWNER_GUID and OWNER_GUID not in data["admins"]:
 client = Client(name=SESSION_NAME)
 
 pending_guess = {}   # {chat_guid: number}  -> بازی حدس عدد
+pending_math = {}    # {chat_guid: answer}  -> بازی ریاضی سریع
+pending_dooz = {}    # {chat_guid: [9 خانه]} -> بازی دوز
+group_message_count = {}  # {group_guid: count} -> برای «آمار گروه»
 pending_reminders = []  # [{"chat":..., "text":..., "at": ts}]
+
+
+def render_dooz(board):
+    symbols = {" ": "▫️", "X": "❌", "O": "⭕"}
+    rows = []
+    for r in range(3):
+        rows.append("".join(symbols[board[r * 3 + c]] for c in range(3)))
+    return "\n".join(rows)
+
+
+def dooz_winner(board):
+    lines = [(0, 1, 2), (3, 4, 5), (6, 7, 8), (0, 3, 6), (1, 4, 7), (2, 5, 8), (0, 4, 8), (2, 4, 6)]
+    for a, b, c in lines:
+        if board[a] != " " and board[a] == board[b] == board[c]:
+            return board[a]
+    if " " not in board:
+        return "draw"
+    return None
 
 QUIZ_BANK = [
     {"q": "پایتخت فرانسه کدام است؟", "options": ["لندن", "پاریس", "رم", "برلین"], "answer": "ب"},
@@ -188,6 +212,24 @@ MORSE_TABLE = {
 }
 MORSE_REVERSE = {v: k for k, v in MORSE_TABLE.items()}
 
+# چت خودکار در گروه: برای طبیعی‌ماندن رفتار، فقط با شانس کم و فاصله‌ی زمانی
+# جواب می‌دهد، نه به هر پیام — رفتار خیلی سریع/به همه‌چیز، مشکوک و اسپم‌مانند
+# به‌نظر می‌رسد و ریسک محدودشدن اکانت را بالا می‌برد.
+AUTO_CHAT_REPLY_CHANCE = 0.12
+AUTO_CHAT_COOLDOWN_SECONDS = 180
+
+AUTO_CHAT_LINES = [
+    "😄 دقیقا!",
+    "جالبه، بیشتر بگو",
+    "🔥🔥🔥",
+    "من که موافقم",
+    "هه هه، خوب بود",
+    "واقعا؟ باورم نمیشه 😅",
+    "این حرفتو قبول دارم",
+    "😂😂",
+]
+
+
 
 def is_admin(guid: str) -> bool:
     return OWNER_GUID is None or guid == OWNER_GUID or guid in data["admins"]
@@ -227,6 +269,8 @@ HELP_TEXT = """📖 راهنمای ربات (نسخه‌ی روبیکا)
 
 🔹 گروه‌ها
 افزودن گروه <guid> | لیست گروه‌ها | حذف گروه <شماره>
+چت خودکار روشن <شماره> — بعضی‌وقت‌ها با شانس کم به پیام بچه‌های گروه جواب می‌دهد
+چت خودکار خاموش <شماره>
 
 🔹 بنر (فقط دستی — بدون ارسال خودکار تکرارشونده)
 ثبت بنر (با ریپلای) | بنر (پیش‌نمایش) | ارسال بنر <شماره یا all>
@@ -253,6 +297,23 @@ HELP_TEXT = """📖 راهنمای ربات (نسخه‌ی روبیکا)
 رمزعبور بساز <طول عدد، پیش‌فرض ۱۲>
 قرعه کشی <گزینه۱> | <گزینه۲> | ...
 تبدیل دما <عدد سلسیوس> / تبدیل کیلومتر <عدد> / تبدیل کیلوگرم <عدد>
+تبدیل متر <عدد> / تبدیل لیتر <عدد>
+محاسبه سن <YYYY-MM-DD>
+ساعت شهرها — تهران/لندن/نیویورک/توکیو
+
+🔹 سرگرمی بیشتر
+جدول ضرب <عدد>
+ریاضی سریع — بعد فقط جواب رو بفرست
+دوز — بازی با ربات؛ با عدد ۱ تا ۹ خانه انتخاب کن
+
+🔹 شخصی‌سازی
+لحن شوخی / لحن رسمی
+
+🔹 مدیریت گروه (بخشی، بقیه بعداً)
+آمار گروه <شماره> — تعداد پیام (از لحظه‌ی روشن‌شدن ربات) + تعداد اعضا (best-effort)
+نظرسنجی <شماره گروه> <سؤال> | <گزینه۱> | <گزینه۲> | ...
+رای <کد نظرسنجی> <شماره گزینه> — در خود گروه
+نتیجه نظرسنجی <کد نظرسنجی>
 
 🔹 ساعت، تاریخ و ابزار
 ساعت / تاریخ / حساب <عبارت>
@@ -324,6 +385,9 @@ async def on_message(update):
     if not text:
         return
 
+    if is_group_chat and chat:
+        group_message_count[chat] = group_message_count.get(chat, 0) + 1
+
     # ---------- بازی حدس عدد: اگر منتظر عدد هستیم ----------
     if chat in pending_guess and text.isdigit():
         target = pending_guess[chat]
@@ -335,6 +399,39 @@ async def on_message(update):
             await update.reply("بزرگ‌تر بگو ⬆️")
         else:
             await update.reply("کوچک‌تر بگو ⬇️")
+        return
+
+    # ---------- بازی ریاضی سریع: اگر منتظر جواب هستیم ----------
+    if chat in pending_math and text.lstrip("-").isdigit():
+        if int(text) == pending_math[chat]:
+            await update.reply("🎉 درست بود!")
+        else:
+            await update.reply(f"❌ نه، جواب درست {pending_math[chat]} بود.")
+        del pending_math[chat]
+        return
+
+    # ---------- بازی دوز: اگر منتظر حرکت هستیم ----------
+    if chat in pending_dooz and text.isdigit() and 1 <= int(text) <= 9:
+        board = pending_dooz[chat]
+        pos = int(text) - 1
+        if board[pos] != " ":
+            await update.reply("این خانه پر است، یکی دیگه انتخاب کن.")
+            return
+        board[pos] = "X"
+        w = dooz_winner(board)
+        if w:
+            await update.reply(render_dooz(board) + ("\n\n🎉 شما بردید!" if w == "X" else "\n\n🤝 مساوی شد!"))
+            del pending_dooz[chat]
+            return
+        empty = [i for i, v in enumerate(board) if v == " "]
+        if empty:
+            board[random.choice(empty)] = "O"
+        w = dooz_winner(board)
+        msg = render_dooz(board)
+        if w:
+            msg += "\n\n😄 من بردم!" if w == "O" else "\n\n🤝 مساوی شد!"
+            del pending_dooz[chat]
+        await update.reply(msg)
         return
 
     # ---------- دیباگ موقت: نشان‌دادن فیلدهای واقعی آبجکت update ----------
@@ -384,6 +481,14 @@ async def on_message(update):
     # منشی/پرسش‌وپاسخ می‌گیرد و ادمین به منوی کامل دستورات می‌رسد.
     if is_group_chat:
         if not is_admin(sender):
+            ac = data.get("auto_chat_groups", {}).get(chat)
+            if ac and ac.get("enabled"):
+                now = time.time()
+                cooldown_ok = now - ac.get("last_reply", 0) >= AUTO_CHAT_COOLDOWN_SECONDS
+                if cooldown_ok and random.random() < AUTO_CHAT_REPLY_CHANCE:
+                    ac["last_reply"] = now
+                    save_data(data)
+                    await update.reply(random.choice(AUTO_CHAT_LINES))
             return
     else:
         if not is_admin(sender):
@@ -444,6 +549,31 @@ async def on_message(update):
         removed = data["groups"].pop(idx)
         save_data(data)
         await update.reply(f"🗑 گروه «{removed['title']}» حذف شد.")
+        return
+
+    if text.startswith("چت خودکار روشن"):
+        idx = find_group_index(text.replace("چت خودکار روشن", "", 1).strip())
+        if idx is None:
+            await update.reply("مثال: چت خودکار روشن 1")
+            return
+        g = data["groups"][idx]
+        data["auto_chat_groups"][g["guid"]] = {"enabled": True, "last_reply": 0}
+        save_data(data)
+        await update.reply(
+            f"✅ چت خودکار برای «{g['title']}» روشن شد.\n"
+            "توجه: فقط گاهی و با فاصله جواب می‌دهد تا طبیعی بماند، نه به هر پیام."
+        )
+        return
+
+    if text.startswith("چت خودکار خاموش"):
+        idx = find_group_index(text.replace("چت خودکار خاموش", "", 1).strip())
+        if idx is None:
+            await update.reply("مثال: چت خودکار خاموش 1")
+            return
+        g = data["groups"][idx]
+        data["auto_chat_groups"].pop(g["guid"], None)
+        save_data(data)
+        await update.reply(f"🔴 چت خودکار برای «{g['title']}» خاموش شد.")
         return
 
     # ---------- بنر (دستی) ----------
@@ -755,6 +885,171 @@ async def on_message(update):
             await update.reply(f"{kg} کیلوگرم = {lbs:.2f} پوند")
         except Exception:
             await update.reply("مثال: تبدیل کیلوگرم 70")
+        return
+
+    # ---------- سرگرمی بیشتر ----------
+    if text.startswith("جدول ضرب"):
+        arg = text.replace("جدول ضرب", "", 1).strip()
+        if not arg.isdigit():
+            await update.reply("مثال: جدول ضرب 7")
+            return
+        n = int(arg)
+        lines = [f"{n} × {i} = {n*i}" for i in range(1, 11)]
+        await update.reply("\n".join(lines))
+        return
+
+    if text == "ریاضی سریع":
+        a, b = random.randint(2, 50), random.randint(2, 50)
+        op = random.choice(["+", "-", "*"])
+        answer = {"+": a + b, "-": a - b, "*": a * b}[op]
+        pending_math[chat] = answer
+        await update.reply(f"🧮 {a} {op} {b} = ؟\n(فقط جواب رو بفرست)")
+        return
+
+    if text == "دوز":
+        pending_dooz[chat] = [" "] * 9
+        await update.reply(render_dooz(pending_dooz[chat]) + "\n\nخانه‌ی موردنظر رو با عدد ۱ تا ۹ بفرست.")
+        return
+
+    # ---------- ابزار بیشتر ----------
+    if text.startswith("محاسبه سن"):
+        arg = text.replace("محاسبه سن", "", 1).strip()
+        try:
+            import datetime
+            y, m, d = [int(p) for p in arg.split("-")]
+            born = datetime.date(y, m, d)
+            today = datetime.date.today()
+            age = today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+            await update.reply(f"🎂 سن: {age} سال")
+        except Exception:
+            await update.reply("مثال: محاسبه سن 2000-05-20")
+        return
+
+    if text == "ساعت شهرها":
+        try:
+            from zoneinfo import ZoneInfo
+            import datetime
+            cities = [
+                ("تهران", "Asia/Tehran"), ("لندن", "Europe/London"),
+                ("نیویورک", "America/New_York"), ("توکیو", "Asia/Tokyo"),
+            ]
+            lines = []
+            for name, tz in cities:
+                now = datetime.datetime.now(ZoneInfo(tz))
+                lines.append(f"{name}: {now.strftime('%H:%M')}")
+            await update.reply("🌍 " + "\n".join(lines))
+        except Exception:
+            await update.reply("خطا در تعیین ساعت شهرها.")
+        return
+
+    if text.startswith("تبدیل متر"):
+        arg = text.replace("تبدیل متر", "", 1).strip()
+        try:
+            m = float(arg)
+            await update.reply(f"{m} متر = {m*3.28084:.2f} فوت")
+        except Exception:
+            await update.reply("مثال: تبدیل متر 5")
+        return
+
+    if text.startswith("تبدیل لیتر"):
+        arg = text.replace("تبدیل لیتر", "", 1).strip()
+        try:
+            l = float(arg)
+            await update.reply(f"{l} لیتر = {l*0.264172:.2f} گالن")
+        except Exception:
+            await update.reply("مثال: تبدیل لیتر 10")
+        return
+
+    # ---------- شخصی‌سازی ----------
+    if text == "لحن شوخی":
+        data["tone"] = "casual"
+        save_data(data)
+        await update.reply("باشه رفیق، از این به بعد راحت‌تر حرف می‌زنم 😄")
+        return
+    if text == "لحن رسمی":
+        data["tone"] = "formal"
+        save_data(data)
+        await update.reply("بله، از این پس با لحن رسمی پاسخ می‌دهم.")
+        return
+
+    # ---------- مدیریت گروه (best-effort) ----------
+    if text.startswith("آمار گروه"):
+        idx = find_group_index(text.replace("آمار گروه", "", 1).strip())
+        if idx is None:
+            await update.reply("مثال: آمار گروه 1")
+            return
+        g = data["groups"][idx]
+        msg_count = group_message_count.get(g["guid"], 0)
+        member_info = "نامشخص"
+        try:
+            info = await client.get_chat(g["guid"])
+            member_info = getattr(info, "count_members", None) or getattr(info, "members_count", None) or "نامشخص"
+        except Exception:
+            pass
+        await update.reply(
+            f"📊 آمار «{g['title']}»\nپیام‌ها (از لحظه‌ی روشن‌شدن ربات): {msg_count}\nتعداد اعضا: {member_info}"
+        )
+        return
+
+    if text.startswith("نظرسنجی"):
+        rest = text.replace("نظرسنجی", "", 1).strip()
+        parts = rest.split(" ", 1)
+        if len(parts) < 2 or not parts[0].isdigit():
+            await update.reply("مثال: نظرسنجی 1 رنگ مورد علاقه؟ | قرمز | آبی | سبز")
+            return
+        idx = find_group_index(parts[0])
+        if idx is None:
+            await update.reply("شماره گروه نامعتبر است.")
+            return
+        if "|" not in parts[1]:
+            await update.reply("مثال: نظرسنجی 1 رنگ مورد علاقه؟ | قرمز | آبی | سبز")
+            return
+        q_and_opts = [p.strip() for p in parts[1].split("|")]
+        question, options = q_and_opts[0], q_and_opts[1:]
+        if len(options) < 2:
+            await update.reply("حداقل ۲ گزینه لازم است.")
+            return
+        g = data["groups"][idx]
+        poll_id = str(int(time.time()))
+        data.setdefault("polls", {})[poll_id] = {
+            "guid": g["guid"], "question": question, "options": options,
+            "votes": {o: 0 for o in options}, "voted_users": [],
+        }
+        save_data(data)
+        opts_text = "\n".join(f"{i+1}. {o}" for i, o in enumerate(options))
+        await client.send_message(
+            g["guid"],
+            f"📊 نظرسنجی: {question}\n{opts_text}\n\nرای بده با: رای {poll_id} <شماره گزینه>",
+        )
+        await update.reply(f"✅ نظرسنجی ارسال شد. کد نظرسنجی: {poll_id}")
+        return
+
+    if text.startswith("رای "):
+        parts = text.split(" ")
+        if len(parts) != 3 or parts[1] not in data.get("polls", {}) or not parts[2].isdigit():
+            return
+        poll = data["polls"][parts[1]]
+        if sender in poll["voted_users"]:
+            await update.reply("شما قبلاً رای داده‌اید.")
+            return
+        opt_idx = int(parts[2]) - 1
+        if not (0 <= opt_idx < len(poll["options"])):
+            await update.reply("شماره گزینه نامعتبر است.")
+            return
+        poll["votes"][poll["options"][opt_idx]] += 1
+        poll["voted_users"].append(sender)
+        save_data(data)
+        await update.reply("✅ رای شما ثبت شد.")
+        return
+
+    if text.startswith("نتیجه نظرسنجی"):
+        poll_id = text.replace("نتیجه نظرسنجی", "", 1).strip()
+        poll = data.get("polls", {}).get(poll_id)
+        if not poll:
+            await update.reply("نظرسنجی پیدا نشد.")
+            return
+        lines = [f"📊 {poll['question']}"] + [f"{o}: {c} رای" for o, c in poll["votes"].items()]
+        await update.reply("\n".join(lines))
         return
 
     # ---------- ساعت و تاریخ ----------
