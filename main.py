@@ -272,15 +272,44 @@ async def on_message(update):
             await update.reply("کوچک‌تر بگو ⬇️")
         return
 
+    # ---------- دیباگ موقت: نشان‌دادن فیلدهای واقعی آبجکت update ----------
+    # (بعد از حل شدن مشکل «ثبت بنر»، این بلوک را می‌توانید حذف کنید)
+    if text == "دیباگ" and is_admin(sender):
+        try:
+            all_attrs = [a for a in dir(update) if not a.startswith("_")]
+            info = [f"chat={chat}", f"sender={sender}", f"is_group={is_group_chat}"]
+            info.append("فیلدهای موجود: " + ", ".join(all_attrs))
+            for cand in ("reply_message", "reply_to", "reply_to_message", "message_reply",
+                          "replied_message", "reply", "reply_message_id"):
+                val = getattr(update, cand, "—ندارد—")
+                info.append(f"{cand} = {val!r}")
+            await update.reply("\n".join(info)[:3900])
+        except Exception as e:
+            await update.reply(f"خطا در دیباگ: {e}")
+        return
+
     # ---------- ثبت بنر (هم در گروه، هم در پیوی؛ نیاز به ریپلای) ----------
     if text == "ثبت بنر":
         if not is_admin(sender):
             return
-        reply_msg = getattr(update, "reply_message", None) or getattr(update, "reply_to", None)
+        reply_msg = None
+        for cand in ("reply_message", "reply_to", "reply_to_message",
+                      "message_reply", "replied_message", "reply"):
+            reply_msg = getattr(update, cand, None)
+            if reply_msg:
+                break
         if not reply_msg:
-            await update.reply("این دستور را باید روی یک پیام ریپلای کنید.")
+            await update.reply(
+                "این دستور را باید روی یک پیام ریپلای کنید.\n"
+                "(اگر مطمئنید ریپلای کرده‌اید ولی باز این پیام را می‌بینید، "
+                "روی همان پیام ریپلای کنید و بفرستید «دیباگ» تا مشکل را دقیق پیدا کنیم.)"
+            )
             return
-        banner_text = getattr(reply_msg, "text", None) or ""
+        banner_text = (
+            getattr(reply_msg, "text", None)
+            or getattr(reply_msg, "message", None)
+            or ""
+        )
         data["banner"] = {"text": banner_text, "set_by": sender}
         save_data(data)
         await update.reply("✅ بنر ذخیره شد.")
