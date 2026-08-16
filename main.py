@@ -133,6 +133,61 @@ FORTUNES = [
     "امروز با یکی از دوستای قدیمیت حرف بزن 📞",
 ]
 
+RIDDLES = [
+    {"q": "چه چیزی هر چه بیشتر از آن برداری، بزرگ‌تر می‌شود؟", "a": "گودال/چاله"},
+    {"q": "چه چیزی دندان دارد ولی نمی‌جود؟", "a": "شانه"},
+    {"q": "چه چیزی همیشه جلوی شماست ولی هرگز نمی‌بینیدش؟", "a": "آینده"},
+    {"q": "چه چیزی وقتی می‌شکند، بهتر کار می‌کند؟", "a": "تخم‌مرغ (برای پخت)"},
+]
+
+PROVERBS = [
+    "آب رفته به جوی بازنمی‌گردد.",
+    "تا نباشد چیزکی، مردم نگویند چیزها.",
+    "کار نیکو کردن از پر کردن است.",
+    "هر که بامش بیش، برفش بیشتر.",
+    "دوست آن است که بگیرد دست دوست، در پریشان‌حالی و درماندگی.",
+]
+
+FACTS = [
+    "قلب یک میگو در سرش قرار دارد 🦐",
+    "عسل هرگز فاسد نمی‌شود؛ عسل هزاران‌ساله هنوز قابل خوردن است 🍯",
+    "اختاپوس سه تا قلب دارد 🐙",
+    "یک روز روی سیاره‌ی زهره از یک سال آن طولانی‌تر است 🪐",
+]
+
+MOTIVATIONS = [
+    "امروز یه قدم کوچیک بردار، فردا نتیجه‌شو می‌بینی 💪",
+    "بهترین زمان برای شروع، همینه که هست ⏳",
+    "هر روز یه فرصت تازه‌ست برای بهتر شدن 🌱",
+]
+
+RANDOM_NAMES = [
+    "آرمان", "پارمیس", "کیانا", "بردیا", "ترانه", "سامان", "نگین", "آرش",
+]
+
+TRUTHS = [
+    "بزرگ‌ترین ترست چیه؟",
+    "یه رازی که تا حالا به کسی نگفتی چیه؟",
+    "اگه می‌تونستی یه روز رو دوباره زندگی کنی، کدوم روز رو انتخاب می‌کردی؟",
+]
+
+DARES = [
+    "یه ایموجی رندوم به‌جای هر حرف پیامت بذار.",
+    "یه صدای خنده‌دار ضبط کن و بفرست.",
+    "به یکی پیام بده و بگو امروز چقدر باحاله.",
+]
+
+MORSE_TABLE = {
+    'a': '.-', 'b': '-...', 'c': '-.-.', 'd': '-..', 'e': '.', 'f': '..-.',
+    'g': '--.', 'h': '....', 'i': '..', 'j': '.---', 'k': '-.-', 'l': '.-..',
+    'm': '--', 'n': '-.', 'o': '---', 'p': '.--.', 'q': '--.-', 'r': '.-.',
+    's': '...', 't': '-', 'u': '..-', 'v': '...-', 'w': '.--', 'x': '-..-',
+    'y': '-.--', 'z': '--..', '0': '-----', '1': '.----', '2': '..---',
+    '3': '...--', '4': '....-', '5': '.....', '6': '-....', '7': '--...',
+    '8': '---..', '9': '----.',
+}
+MORSE_REVERSE = {v: k for k, v in MORSE_TABLE.items()}
+
 
 def is_admin(guid: str) -> bool:
     return OWNER_GUID is None or guid == OWNER_GUID or guid in data["admins"]
@@ -189,6 +244,15 @@ HELP_TEXT = """📖 راهنمای ربات (نسخه‌ی روبیکا)
 
 🔹 بازی و سرگرمی
 تاس / سکه / سنگ کاغذ قیچی <سنگ|کاغذ|قیچی> / حدس عدد / چالش / جوک / فال
+چیستان / ضرب المثل / میدونستی / انگیزه / اسم تصادفی / حقیقت / جرات
+
+🔹 ابزار جدید
+آمار متن <متن> — تعداد کاراکتر و کلمه
+برعکس <متن>
+مورس <متن> / رمزگشایی مورس <کد مورس>
+رمزعبور بساز <طول عدد، پیش‌فرض ۱۲>
+قرعه کشی <گزینه۱> | <گزینه۲> | ...
+تبدیل دما <عدد سلسیوس> / تبدیل کیلومتر <عدد> / تبدیل کیلوگرم <عدد>
 
 🔹 ساعت، تاریخ و ابزار
 ساعت / تاریخ / حساب <عبارت>
@@ -584,6 +648,113 @@ async def on_message(update):
         return
     if text == "فال":
         await update.reply(random.choice(FORTUNES))
+        return
+
+    # ---------- قابلیت‌های جدید (محلی، بدون وابستگی به کتابخانه) ----------
+    if text == "چیستان":
+        r = random.choice(RIDDLES)
+        await update.reply(f"🧩 {r['q']}\n\n(جواب: {r['a']})")
+        return
+    if text == "ضرب المثل":
+        await update.reply(f"📜 {random.choice(PROVERBS)}")
+        return
+    if text == "میدونستی":
+        await update.reply(f"💡 آیا می‌دانستید: {random.choice(FACTS)}")
+        return
+    if text == "انگیزه":
+        await update.reply(f"🔥 {random.choice(MOTIVATIONS)}")
+        return
+    if text == "اسم تصادفی":
+        await update.reply(f"🎭 {random.choice(RANDOM_NAMES)}")
+        return
+    if text == "حقیقت":
+        await update.reply(f"🤫 {random.choice(TRUTHS)}")
+        return
+    if text == "جرات":
+        await update.reply(f"😈 {random.choice(DARES)}")
+        return
+
+    if text.startswith("آمار متن"):
+        s = text.replace("آمار متن", "", 1).strip()
+        if not s:
+            await update.reply("مثال: آمار متن سلام دنیا")
+            return
+        chars = len(s)
+        words = len(s.split())
+        await update.reply(f"🔤 تعداد کاراکتر: {chars}\n🔠 تعداد کلمه: {words}")
+        return
+
+    if text.startswith("برعکس"):
+        s = text.replace("برعکس", "", 1).strip()
+        if not s:
+            await update.reply("مثال: برعکس سلام")
+            return
+        await update.reply(s[::-1])
+        return
+
+    if text.startswith("مورس "):
+        s = text.replace("مورس", "", 1).strip().lower()
+        try:
+            out = " ".join(MORSE_TABLE.get(ch, "?") for ch in s if ch != " ")
+            await update.reply(out)
+        except Exception:
+            await update.reply("فقط حروف/اعداد انگلیسی پشتیبانی می‌شود.")
+        return
+
+    if text.startswith("رمزگشایی مورس"):
+        s = text.replace("رمزگشایی مورس", "", 1).strip()
+        try:
+            out = "".join(MORSE_REVERSE.get(code, "?") for code in s.split(" "))
+            await update.reply(out)
+        except Exception:
+            await update.reply("فرمت مورس نامعتبر است.")
+        return
+
+    if text.startswith("رمزعبور بساز"):
+        arg = text.replace("رمزعبور بساز", "", 1).strip()
+        length = int(arg) if arg.isdigit() and 4 <= int(arg) <= 64 else 12
+        chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%"
+        pwd = "".join(random.choice(chars) for _ in range(length))
+        await update.reply(f"🔐 {pwd}")
+        return
+
+    if text.startswith("قرعه کشی"):
+        rest = text.replace("قرعه کشی", "", 1).strip()
+        options = [o.strip() for o in rest.split("|") if o.strip()]
+        if len(options) < 2:
+            await update.reply("مثال: قرعه کشی علی | رضا | سارا")
+            return
+        await update.reply(f"🎯 برنده: {random.choice(options)}")
+        return
+
+    if text.startswith("تبدیل دما"):
+        arg = text.replace("تبدیل دما", "", 1).strip()
+        try:
+            c = float(arg)
+            f = c * 9 / 5 + 32
+            await update.reply(f"{c}°C = {f:.1f}°F")
+        except Exception:
+            await update.reply("مثال: تبدیل دما 25")
+        return
+
+    if text.startswith("تبدیل کیلومتر"):
+        arg = text.replace("تبدیل کیلومتر", "", 1).strip()
+        try:
+            km = float(arg)
+            miles = km * 0.621371
+            await update.reply(f"{km} کیلومتر = {miles:.2f} مایل")
+        except Exception:
+            await update.reply("مثال: تبدیل کیلومتر 10")
+        return
+
+    if text.startswith("تبدیل کیلوگرم"):
+        arg = text.replace("تبدیل کیلوگرم", "", 1).strip()
+        try:
+            kg = float(arg)
+            lbs = kg * 2.20462
+            await update.reply(f"{kg} کیلوگرم = {lbs:.2f} پوند")
+        except Exception:
+            await update.reply("مثال: تبدیل کیلوگرم 70")
         return
 
     # ---------- ساعت و تاریخ ----------
