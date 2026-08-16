@@ -117,7 +117,8 @@ client = Client(name=SESSION_NAME)
 
 pending_guess = {}   # {chat_guid: number}  -> بازی حدس عدد
 pending_math = {}    # {chat_guid: answer}  -> بازی ریاضی سریع
-pending_dooz = {}    # {chat_guid: [9 خانه]} -> بازی دوز
+pending_dooz = {}    # {chat_guid: [9 خانه]} -> بازی دوز (تک‌نفره، با ربات)
+multiplayer_dooz = {}  # {chat_guid: {"board":[...], "players":[p1, p2 یا None], "turn": guid}}
 group_message_count = {}  # {group_guid: count} -> برای «آمار گروه»
 pending_reminders = []  # [{"chat":..., "text":..., "at": ts}]
 
@@ -304,7 +305,10 @@ HELP_TEXT = """📖 راهنمای ربات (نسخه‌ی روبیکا)
 🔹 سرگرمی بیشتر
 جدول ضرب <عدد>
 ریاضی سریع — بعد فقط جواب رو بفرست
-دوز — بازی با ربات؛ با عدد ۱ تا ۹ خانه انتخاب کن
+دوز — بازی تک‌نفره با ربات؛ با عدد ۱ تا ۹ خانه انتخاب کن
+دوز شروع (در گروه) — بازی دونفره با بقیه‌ی اعضای گروه
+دوز پیوستن — نفر دوم با این دستور وارد بازی می‌شود
+دوز لغو
 
 🔹 شخصی‌سازی
 لحن شوخی / لحن رسمی
@@ -432,6 +436,61 @@ async def on_message(update):
             msg += "\n\n😄 من بردم!" if w == "O" else "\n\n🤝 مساوی شد!"
             del pending_dooz[chat]
         await update.reply(msg)
+        return
+
+    # ---------- دوز چندنفره (هر عضو گروه، نه فقط ادمین) ----------
+    if text == "دوز شروع":
+        if not is_group_chat:
+            await update.reply("این حالت فقط داخل گروه کار می‌کند. برای بازی تک‌نفره با ربات: دوز")
+            return
+        if chat in multiplayer_dooz:
+            await update.reply("یک بازی دوز در همین گروه در حال اجراست. برای لغو: دوز لغو")
+            return
+        multiplayer_dooz[chat] = {"board": [" "] * 9, "players": [sender, None], "turn": None}
+        await update.reply("🎮 بازی دوز شروع شد! یک نفر دیگه برای پیوستن بنویسه: دوز پیوستن")
+        return
+
+    if text == "دوز لغو":
+        if chat in multiplayer_dooz and sender in multiplayer_dooz[chat]["players"]:
+            del multiplayer_dooz[chat]
+            await update.reply("بازی لغو شد.")
+        return
+
+    if text == "دوز پیوستن":
+        game = multiplayer_dooz.get(chat)
+        if not game or game["players"][1] is not None:
+            await update.reply("بازی‌ای برای پیوستن نیست. برای شروع: دوز شروع")
+            return
+        if sender == game["players"][0]:
+            await update.reply("نمی‌تونی با خودت بازی کنی؛ یکی دیگه باید بپیونده.")
+            return
+        game["players"][1] = sender
+        game["turn"] = game["players"][0]
+        await update.reply(render_dooz(game["board"]) + "\n\n✅ بازی شروع شد! نوبت با نفر اول (❌) است.")
+        return
+
+    if chat in multiplayer_dooz and multiplayer_dooz[chat]["players"][1] and text.isdigit() and 1 <= int(text) <= 9:
+        game = multiplayer_dooz[chat]
+        if sender not in game["players"]:
+            return
+        if sender != game["turn"]:
+            await update.reply("نوبت شما نیست.")
+            return
+        pos = int(text) - 1
+        if game["board"][pos] != " ":
+            await update.reply("این خانه پر است.")
+            return
+        symbol = "X" if sender == game["players"][0] else "O"
+        game["board"][pos] = symbol
+        w = dooz_winner(game["board"])
+        msg = render_dooz(game["board"])
+        if w:
+            msg += "\n\n🤝 مساوی شد!" if w == "draw" else "\n\n🎉 برنده شد!"
+            del multiplayer_dooz[chat]
+            await update.reply(msg)
+            return
+        game["turn"] = game["players"][1] if sender == game["players"][0] else game["players"][0]
+        await update.reply(msg + "\n\nنوبت نفر بعدیه.")
         return
 
     # ---------- دیباگ موقت: نشان‌دادن فیلدهای واقعی آبجکت update ----------
