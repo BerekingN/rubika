@@ -291,6 +291,15 @@ async def on_message(update):
         return
 
     if not is_admin(sender):
+        # پیام پیوی از یک نفر دیگر (نه ادمین): فقط منشی/پرسش‌وپاسخ پاسخ می‌دهد
+        if data["muted"]:
+            return
+        for q, a in data["qa"].items():
+            if q in text:
+                await update.reply(a)
+                return
+        if data["auto_reply"]["enabled"] and data["auto_reply"]["text"]:
+            await update.reply(data["auto_reply"]["text"])
         return
 
     # ---------- عمومی ----------
@@ -624,21 +633,6 @@ async def on_message(update):
         await update.reply("اگر برای چالش بود، امیدوارم درست گفته باشید! 🙂")
         return
 
-
-# ---------- منشی خودکار در پیوی ----------
-@client.on_message_updates(filters.private & filters.text)
-async def auto_reply_handler(update):
-    if data["muted"]:
-        return
-    text = (update.text or "").strip()
-    for q, a in data["qa"].items():
-        if q in text:
-            await update.reply(a)
-            return
-    if data["auto_reply"]["enabled"] and data["auto_reply"]["text"] and text not in (
-        "راهنما", "پینگ", "آیدی",
-    ):
-        await update.reply(data["auto_reply"]["text"])
 
 
 # ---------------------------------------------------------------------------
