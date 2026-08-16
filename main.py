@@ -180,6 +180,7 @@ HELP_TEXT = """📖 راهنمای ربات (نسخه‌ی روبیکا)
 
 🔹 منشی
 منشی روشن / منشی خاموش / منشی متن <پیام>
+تست منشی — پیش‌نمایش پاسخ خودکار (چون خودتان نمی‌توانید برای خودتان تریگرش کنید)
 پرسش پاسخ افزودن <سوال> | <جواب> / پرسش پاسخ حذف <سوال> / لیست پرسش پاسخ
 
 🔹 امنیت
@@ -473,6 +474,23 @@ async def on_message(update):
         data["auto_reply"]["text"] = msg
         save_data(data)
         await update.reply("✅ متن منشی ذخیره شد.")
+        return
+    if text == "تست منشی":
+        ar = data["auto_reply"]
+        if data["muted"]:
+            await update.reply("منشی غیرفعال است چون «سکوت» روشن است.")
+            return
+        if not ar["enabled"]:
+            await update.reply("منشی خاموش است. اول بزنید: منشی روشن")
+            return
+        if not ar["text"]:
+            await update.reply("متنی برای منشی ثبت نشده. بزنید: منشی متن <پیام>")
+            return
+        await update.reply(
+            "این پیش‌نمایش پاسخ خودکار است (منشی فقط وقتی *شخص دیگری* به "
+            "پیوی شما پیام بدهد فعال می‌شود، نه وقتی خودتان به خودتان بنویسید):\n\n"
+            + ar["text"]
+        )
         return
     if text.startswith("پرسش پاسخ افزودن"):
         rest = text.replace("پرسش پاسخ افزودن", "", 1).strip()
