@@ -286,21 +286,22 @@ async def on_message(update):
         await update.reply("✅ بنر ذخیره شد.")
         return
 
-    # از اینجا به بعد فقط در پیوی/Saved Messages (نه در گروه) پاسخ می‌دهیم
+    # از اینجا به بعد: در گروه فقط ادمین دستور می‌دهد؛ در پیوی، غیرادمین فقط
+    # منشی/پرسش‌وپاسخ می‌گیرد و ادمین به منوی کامل دستورات می‌رسد.
     if is_group_chat:
-        return
-
-    if not is_admin(sender):
-        # پیام پیوی از یک نفر دیگر (نه ادمین): فقط منشی/پرسش‌وپاسخ پاسخ می‌دهد
-        if data["muted"]:
+        if not is_admin(sender):
             return
-        for q, a in data["qa"].items():
-            if q in text:
-                await update.reply(a)
+    else:
+        if not is_admin(sender):
+            if data["muted"]:
                 return
-        if data["auto_reply"]["enabled"] and data["auto_reply"]["text"]:
-            await update.reply(data["auto_reply"]["text"])
-        return
+            for q, a in data["qa"].items():
+                if q in text:
+                    await update.reply(a)
+                    return
+            if data["auto_reply"]["enabled"] and data["auto_reply"]["text"]:
+                await update.reply(data["auto_reply"]["text"])
+            return
 
     # ---------- عمومی ----------
     if text == "راهنما":
