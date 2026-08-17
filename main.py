@@ -20,6 +20,7 @@
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import operator
@@ -27,9 +28,15 @@ import os
 import random
 import re
 import time
+import uuid as uuid_lib
 from pathlib import Path
 
 from rubpy import Client, filters
+
+try:
+    import pyfiglet
+except ImportError:  # کتابخانه اختیاری - فقط برای «ascii art» لازم است
+    pyfiglet = None
 
 # ---------------------------------------------------------------------------
 # تنظیمات پایه
@@ -83,6 +90,7 @@ DEFAULT_DATA = {
     "tone": "formal",           # "formal" یا "casual"
     "polls": {},                 # {poll_id: {...}}
     "auto_chat_groups": {},      # {group_guid: {"enabled": bool, "last_reply": ts}}
+    "self_enabled": True,        # کلید اصلی: وقتی False فقط «سلف روشن» جواب داده می‌شود
 }
 
 
@@ -121,6 +129,9 @@ pending_dooz = {}    # {chat_guid: [9 خانه]} -> بازی دوز (تک‌نف
 multiplayer_dooz = {}  # {chat_guid: {"board":[...], "players":[p1, p2 یا None], "turn": guid}}
 group_message_count = {}  # {group_guid: count} -> برای «آمار گروه»
 pending_reminders = []  # [{"chat":..., "text":..., "at": ts}]
+pending_vuln = {}  # {chat_guid: "توضیح آسیب‌پذیری"} -> بازی «پیدا کن آسیب‌پذیری»
+
+BOT_START_TIME = time.time()
 
 
 def render_dooz(board):
@@ -212,6 +223,46 @@ MORSE_TABLE = {
     '8': '---..', '9': '----.',
 }
 MORSE_REVERSE = {v: k for k, v in MORSE_TABLE.items()}
+
+SECURITY_QUIZ_BANK = [
+    {"q": "کدام پسورد قوی‌تر است؟", "options": ["123456", "P@ssw0rd!7kX", "qwerty", "aaaaaa"], "answer": "ب"},
+    {"q": "کار 2FA (احراز هویت دومرحله‌ای) چیست؟", "options": ["افزایش سرعت اینترنت", "یک لایه‌ی امنیتی اضافه", "حذف نیاز به رمز عبور", "هیچکدام"], "answer": "ب"},
+    {"q": "کدام کار امن‌تر است؟", "options": ["یک رمز برای همه‌ی سایت‌ها", "کلیک روی لینک ناشناس", "رمز متفاوت برای هر سایت", "اشتراک پسورد در گروه"], "answer": "ج"},
+    {"q": "دریافت لینک مشکوک از یک شماره‌ی ناشناس یعنی چه؟", "options": ["احتمالاً فیشینگ است", "حتماً امن است", "باید فوراً کلیک کرد", "باید فوروارد کرد"], "answer": "الف"},
+]
+
+# نمونه‌کدهای «آسیب‌پذیر» ساختگی برای بازی آموزشی — فقط جهت تمرین تشخیص، بدون اجرای واقعی
+VULN_SNIPPETS = [
+    {
+        "code": "query = 'SELECT * FROM users WHERE id = ' + user_id",
+        "hint": "SQL Injection — ورودی کاربر مستقیم و بدون پارامتر داخل کوئری قرار گرفته",
+    },
+    {
+        "code": "eval(user_input)",
+        "hint": "اجرای کد دلخواه (RCE) — هرگز ورودی کاربر رو مستقیم eval نکن",
+    },
+    {
+        "code": 'password = "admin123"  # رمز عبور هاردکد شده در سورس',
+        "hint": "رمز عبور به‌صورت هاردکد در سورس‌کد — باید در متغیر محیطی/Secret باشد",
+    },
+    {
+        "code": "os.system('ping ' + host)",
+        "hint": "Command Injection — ورودی کاربر مستقیم وارد دستور سیستم‌عامل شده",
+    },
+]
+
+
+def caesar_cipher(text: str, shift: int) -> str:
+    """رمزگذاری/رمزگشایی سزار روی حروف انگلیسی (بقیه‌ی کاراکترها دست‌نخورده می‌مانند)."""
+    out = []
+    for ch in text:
+        if "a" <= ch <= "z":
+            out.append(chr((ord(ch) - ord("a") + shift) % 26 + ord("a")))
+        elif "A" <= ch <= "Z":
+            out.append(chr((ord(ch) - ord("A") + shift) % 26 + ord("A")))
+        else:
+            out.append(ch)
+    return "".join(out)
 
 # چت خودکار در گروه: برای طبیعی‌ماندن رفتار، فقط با شانس کم و فاصله‌ی زمانی
 # جواب می‌دهد، نه به هر پیام — رفتار خیلی سریع/به همه‌چیز، مشکوک و اسپم‌مانند
@@ -313,6 +364,28 @@ HELP_TEXT = """📖 راهنمای ربات (نسخه‌ی روبیکا)
 🔹 شخصی‌سازی
 لحن شوخی / لحن رسمی
 
+🔹 سلف روشن / خاموش (کلید اصلی ربات)
+سلف روشن / سلف خاموش / سلف وضعیت
+وقتی خاموشه، ربات فقط به «سلف روشن» و «سلف وضعیت» جواب می‌ده.
+
+🔹 تم برنامه‌نویسی
+تبدیل باینری <عدد> / تبدیل هگز <عدد>
+دودویی به عدد <باینری> / هگز به عدد <هگز>
+regex تست <الگو> | <متن>
+json فرمت (با ریپلای روی یک پیام JSON)
+رمز سزار <شیفت> <متن> / رمزگشایی سزار <شیفت> <متن> / رمز rot13 <متن>
+بیس64 انکد <متن> / بیس64 دیکد <متن>
+هش md5 <متن> / هش sha256 <متن>
+uuid بساز
+ascii art <متن انگلیسی>
+
+🔹 بخش هکری (فقط طنز/نمایشی — بدون هیچ دسترسی یا نفوذ واقعی)
+هک کن <نام> — انیمیشن متنی شوخی
+matrix — افکت بارش کاراکتر
+اسکن گروه (در گروه) / ترمینال / neofetch / boot
+چالش امنیتی — کوییز آموزشی امنیت
+پیدا کن آسیب پذیری — یه کد با باگ امنیتی نشون می‌ده / پاسخ آسیب پذیری
+
 🔹 مدیریت گروه (بخشی، بقیه بعداً)
 آمار گروه <شماره> — تعداد پیام (از لحظه‌ی روشن‌شدن ربات) + تعداد اعضا (best-effort)
 نظرسنجی <شماره گروه> <سؤال> | <گزینه۱> | <گزینه۲> | ...
@@ -391,6 +464,32 @@ async def on_message(update):
 
     if is_group_chat and chat:
         group_message_count[chat] = group_message_count.get(chat, 0) + 1
+
+    # ---------- سلف روشن / خاموش (کلید اصلی ربات — بالاترین اولویت) ----------
+    if text in ("سلف روشن", "سلف خاموش", "سلف وضعیت"):
+        if not is_admin(sender):
+            return
+        if text == "سلف روشن":
+            data["self_enabled"] = True
+            save_data(data)
+            await update.reply("✅ سلف روشن شد. همه‌ی دستورات دوباره فعالند.")
+        elif text == "سلف خاموش":
+            data["self_enabled"] = False
+            save_data(data)
+            await update.reply(
+                "🔴 سلف خاموش شد.\nاز این پس فقط «سلف روشن» و «سلف وضعیت» پاسخ داده می‌شوند."
+            )
+        else:
+            status = "روشن ✅" if data.get("self_enabled", True) else "خاموش 🔴"
+            up = int(time.time() - BOT_START_TIME)
+            h, rem = divmod(up, 3600)
+            m, _ = divmod(rem, 60)
+            await update.reply(f"وضعیت سلف: {status}\nمدت اجرای فرآیند: {h} ساعت و {m} دقیقه")
+        return
+
+    if not data.get("self_enabled", True):
+        # سلف خاموش است؛ به هیچ دستور دیگری (حتی ثبت بنر/دیباگ) پاسخ نده.
+        return
 
     # ---------- بازی حدس عدد: اگر منتظر عدد هستیم ----------
     if chat in pending_guess and text.isdigit():
@@ -1199,6 +1298,270 @@ async def on_message(update):
             await update.reply("پیدا نشد.")
             return
         await update.reply(data["saved"][tag])
+        return
+
+    # ---------- تم برنامه‌نویسی: تبدیل مبنا ----------
+    if text.startswith("تبدیل باینری"):
+        arg = text.replace("تبدیل باینری", "", 1).strip()
+        try:
+            n = int(arg)
+            await update.reply(f"{n} = {bin(n)[2:] if n >= 0 else '-' + bin(-n)[2:]} (باینری)")
+        except Exception:
+            await update.reply("مثال: تبدیل باینری 42")
+        return
+
+    if text.startswith("تبدیل هگز"):
+        arg = text.replace("تبدیل هگز", "", 1).strip()
+        try:
+            n = int(arg)
+            await update.reply(f"{n} = {hex(n)[2:] if n >= 0 else '-' + hex(-n)[2:]} (هگزادسیمال)")
+        except Exception:
+            await update.reply("مثال: تبدیل هگز 255")
+        return
+
+    if text.startswith("دودویی به عدد"):
+        arg = text.replace("دودویی به عدد", "", 1).strip()
+        try:
+            n = int(arg, 2)
+            await update.reply(f"{arg} = {n} (دهدهی)")
+        except Exception:
+            await update.reply("مثال: دودویی به عدد 101010")
+        return
+
+    if text.startswith("هگز به عدد"):
+        arg = text.replace("هگز به عدد", "", 1).strip()
+        try:
+            n = int(arg, 16)
+            await update.reply(f"{arg} = {n} (دهدهی)")
+        except Exception:
+            await update.reply("مثال: هگز به عدد ff")
+        return
+
+    # ---------- تم برنامه‌نویسی: ابزار توسعه‌دهنده ----------
+    if text.startswith("regex تست"):
+        rest = text.replace("regex تست", "", 1).strip()
+        if "|" not in rest:
+            await update.reply("مثال: regex تست ^[0-9]+$ | 12345")
+            return
+        pattern, sample = [p.strip() for p in rest.split("|", 1)]
+        try:
+            match = re.fullmatch(pattern, sample)
+            await update.reply("✅ مچ شد!" if match else "❌ مچ نشد.")
+        except re.error as e:
+            await update.reply(f"الگوی regex نامعتبر است: {e}")
+        return
+
+    if text == "json فرمت":
+        reply_msg = None
+        for cand in ("reply_message", "reply_to", "reply_to_message",
+                      "message_reply", "replied_message", "reply"):
+            reply_msg = getattr(update, cand, None)
+            if reply_msg:
+                break
+        if not reply_msg:
+            await update.reply("این دستور را با ریپلای روی یک پیام حاوی JSON بفرستید.")
+            return
+        raw = getattr(reply_msg, "text", None) or getattr(reply_msg, "message", None) or ""
+        try:
+            parsed = json.loads(raw)
+            pretty = json.dumps(parsed, ensure_ascii=False, indent=2)
+            await update.reply(f"```\n{pretty}\n```")
+        except Exception as e:
+            await update.reply(f"JSON نامعتبر است: {e}")
+        return
+
+    if text.startswith("رمز سزار"):
+        arg = text.replace("رمز سزار", "", 1).strip()
+        parts = arg.split(" ", 1)
+        if len(parts) < 2 or not parts[0].lstrip("-").isdigit():
+            await update.reply("مثال: رمز سزار 3 Hello World")
+            return
+        await update.reply(caesar_cipher(parts[1], int(parts[0])))
+        return
+
+    if text.startswith("رمزگشایی سزار"):
+        arg = text.replace("رمزگشایی سزار", "", 1).strip()
+        parts = arg.split(" ", 1)
+        if len(parts) < 2 or not parts[0].lstrip("-").isdigit():
+            await update.reply("مثال: رمزگشایی سزار 3 Khoor Zruog")
+            return
+        await update.reply(caesar_cipher(parts[1], -int(parts[0])))
+        return
+
+    if re.match(r"^رمز\s*rot13", text, re.IGNORECASE):
+        arg = re.sub(r"^رمز\s*rot13", "", text, flags=re.IGNORECASE).strip()
+        if not arg:
+            await update.reply("مثال: رمز rot13 Hello")
+            return
+        await update.reply(caesar_cipher(arg, 13))
+        return
+
+    if text.startswith("بیس64 انکد"):
+        arg = text.replace("بیس64 انکد", "", 1).strip()
+        if not arg:
+            await update.reply("مثال: بیس64 انکد سلام")
+            return
+        await update.reply(base64.b64encode(arg.encode("utf-8")).decode("utf-8"))
+        return
+
+    if text.startswith("بیس64 دیکد"):
+        arg = text.replace("بیس64 دیکد", "", 1).strip()
+        if not arg:
+            await update.reply("مثال: بیس64 دیکد c2xhbQ==")
+            return
+        try:
+            await update.reply(base64.b64decode(arg).decode("utf-8", errors="replace"))
+        except Exception:
+            await update.reply("رشته‌ی base64 نامعتبر است.")
+        return
+
+    if text.startswith("هش md5"):
+        arg = text.replace("هش md5", "", 1).strip()
+        if not arg:
+            await update.reply("مثال: هش md5 سلام")
+            return
+        await update.reply(hashlib.md5(arg.encode("utf-8")).hexdigest())
+        return
+
+    if text.startswith("هش sha256"):
+        arg = text.replace("هش sha256", "", 1).strip()
+        if not arg:
+            await update.reply("مثال: هش sha256 سلام")
+            return
+        await update.reply(hashlib.sha256(arg.encode("utf-8")).hexdigest())
+        return
+
+    if text == "uuid بساز":
+        await update.reply(str(uuid_lib.uuid4()))
+        return
+
+    if text.startswith("ascii art") or text.startswith("اسکی آرت"):
+        arg = re.sub(r"^(ascii art|اسکی آرت)", "", text, flags=re.IGNORECASE).strip()
+        if not arg:
+            await update.reply("مثال: ascii art HELLO")
+            return
+        if pyfiglet is None:
+            await update.reply(
+                "این قابلیت نیاز به کتابخانه‌ی pyfiglet دارد. به requirements.txt اضافه شده؛ "
+                "بعد از Redeploy روی Railway فعال می‌شود."
+            )
+            return
+        try:
+            art = pyfiglet.figlet_format(arg[:20])
+            await update.reply(f"```\n{art}\n```")
+        except Exception:
+            await update.reply("خطا در ساخت ascii art (فقط حروف/اعداد انگلیسی پشتیبانی می‌شود).")
+        return
+
+    # ---------- بخش هکری (طنز/نمایشی — بدون هیچ دسترسی یا نفوذ واقعی) ----------
+    if text.startswith("هک کن"):
+        target = text.replace("هک کن", "", 1).strip() or "هدف ناشناس"
+        steps = [
+            f"🕶️ شروع «نفوذ» به {target}...",
+            "🔍 اسکن پورت‌ها... انجام شد",
+            "🔓 دور زدن فایروال... 47٪",
+            "🔓 دور زدن فایروال... 92٪",
+            "🔑 رمزگشایی...",
+            f"✅ هک شد! رمز {target}: `123456` 😄\n(کاملاً شوخیه، هیچ داده‌ی واقعی‌ای گرفته نشد)",
+        ]
+        for s in steps:
+            await update.reply(s)
+            await asyncio.sleep(0.9)
+        return
+
+    if text == "matrix":
+        chars = "01ABZ٠١٢٣مصلعرشقط@#%$"
+        lines = ["".join(random.choice(chars) for _ in range(20)) for _ in range(8)]
+        await update.reply("```\n" + "\n".join(lines) + "\n```")
+        return
+
+    if text == "اسکن گروه":
+        if not is_group_chat:
+            await update.reply("این دستور فقط داخل گروه معنی می‌ده.")
+            return
+        member_info = "نامشخص"
+        try:
+            info = await client.get_chat(chat)
+            member_info = getattr(info, "count_members", None) or getattr(info, "members_count", None) or "نامشخص"
+        except Exception:
+            pass
+        suspicious = random.randint(0, 3)
+        await update.reply(
+            f"📡 در حال اسکن گروه...\n👥 اعضا: {member_info}\n😏 {suspicious} مورد «مشکوک» پیدا شد\n"
+            "(کاملاً شوخیه، این ربات هیچ تحلیل امنیتی واقعی‌ای انجام نمی‌ده)"
+        )
+        return
+
+    if text == "ترمینال":
+        up = int(time.time() - BOT_START_TIME)
+        h, rem = divmod(up, 3600)
+        m, s = divmod(rem, 60)
+        total_msgs = sum(group_message_count.values())
+        lines = [
+            "$ status --self-bot",
+            f"uptime........: {h:02d}:{m:02d}:{s:02d}",
+            f"groups........: {len(data['groups'])}",
+            f"admins........: {len(data['admins'])}",
+            f"messages seen.: {total_msgs}",
+            f"self_enabled..: {data.get('self_enabled', True)}",
+            "$ _",
+        ]
+        await update.reply("```\n" + "\n".join(lines) + "\n```")
+        return
+
+    if text == "neofetch":
+        up = int(time.time() - BOT_START_TIME)
+        h, m = divmod(up // 60, 60)
+        art = ["   /\\_/\\  ", "  ( o.o ) ", "   > ^ <  "]
+        info = [
+            "self-bot@rubika",
+            "----------------",
+            "OS: Railway (Python)",
+            f"Uptime: {h}h {m}m",
+            f"Groups: {len(data['groups'])}",
+        ]
+        rows = max(len(art), len(info))
+        lines = [
+            f"{(art[i] if i < len(art) else ' ' * 10)}   {(info[i] if i < len(info) else '')}"
+            for i in range(rows)
+        ]
+        await update.reply("```\n" + "\n".join(lines) + "\n```")
+        return
+
+    if text == "boot":
+        steps = [
+            "[    ] در حال راه‌اندازی سیستم...",
+            "[ ok ] بارگذاری ماژول‌ها",
+            "[ ok ] اتصال به روبیکا",
+            "[ ok ] بارگذاری دستورات",
+            "✅ سیستم آماده‌ست.",
+        ]
+        for s in steps:
+            await update.reply(s)
+            await asyncio.sleep(0.7)
+        return
+
+    if text == "چالش امنیتی":
+        quiz = random.choice(SECURITY_QUIZ_BANK)
+        opts = "\n".join(f"{L}) {o}" for L, o in zip("ابجد", quiz["options"]))
+        await update.reply(f"🛡 {quiz['q']}\n{opts}\n\nپاسخ با: پاسخ <الف/ب/ج/د>")
+        return
+
+    if text == "پیدا کن آسیب پذیری":
+        item = random.choice(VULN_SNIPPETS)
+        pending_vuln[chat] = item["hint"]
+        await update.reply(
+            f"🐛 این کد یک مشکل امنیتی داره، پیداش کن:\n\n```\n{item['code']}\n```\n\n"
+            "برای دیدن جواب بفرست: پاسخ آسیب پذیری"
+        )
+        return
+
+    if text == "پاسخ آسیب پذیری":
+        hint = pending_vuln.pop(chat, None)
+        if not hint:
+            await update.reply("چالشی ثبت نشده. اول بفرست: پیدا کن آسیب پذیری")
+            return
+        await update.reply(f"✅ جواب: {hint}")
         return
 
     # ---------- پاسخ به چالش ----------
