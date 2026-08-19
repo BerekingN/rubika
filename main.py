@@ -130,8 +130,257 @@ multiplayer_dooz = {}  # {chat_guid: {"board":[...], "players":[p1, p2 یا None
 group_message_count = {}  # {group_guid: count} -> برای «آمار گروه»
 pending_reminders = []  # [{"chat":..., "text":..., "at": ts}]
 pending_vuln = {}  # {chat_guid: "توضیح آسیب‌پذیری"} -> بازی «پیدا کن آسیب‌پذیری»
+mafia_games = {}  # {group_guid: {...}} -> بازی مافیا (یک بازی فعال در هر گروه)
 
 BOT_START_TIME = time.time()
+
+# ---------------------------------------------------------------------------
+# بازی مافیا
+# ---------------------------------------------------------------------------
+
+MAFIA_MIN_PLAYERS = 4
+MAFIA_MAX_PLAYERS = 14
+
+MAFIA_ROLE_MAFIA = "مافیا"
+MAFIA_ROLE_DOCTOR = "دکتر"
+MAFIA_ROLE_DETECTIVE = "کارآگاه"
+MAFIA_ROLE_CITIZEN = "شهروند"
+
+
+def mafia_build_roles(n: int):
+    """بر اساس تعداد بازیکن، لیست نقش‌ها رو می‌سازه."""
+    mafia_count = max(1, n // 4)
+    roles = [MAFIA_ROLE_MAFIA] * mafia_count
+    if n >= MAFIA_MIN_PLAYERS:
+        roles.append(MAFIA_ROLE_DOCTOR)
+    if n >= MAFIA_MIN_PLAYERS + 1:
+        roles.append(MAFIA_ROLE_DETECTIVE)
+    while len(roles) < n:
+        roles.append(MAFIA_ROLE_CITIZEN)
+    random.shuffle(roles)
+    return roles
+
+
+async def mafia_get_name(guid: str) -> str:
+    try:
+        info = await client.get_chat(guid)
+        first = getattr(info, "first_name", None)
+        last = getattr(info, "last_name", None)
+        title = getattr(info, "title", None)
+        name = " ".join(p for p in (first, last) if p) or title
+        return name or guid[:8]
+    except Exception:
+        return guid[:8]
+
+
+def mafia_render_players(game, alive_only=False, numbered_from_order=True):
+    lines = []
+    keys = game.get("order") or list(game["players"].keys())
+    for i, guid in enumerate(keys, 1):
+        p = game["players"].get(guid)
+        if not p:
+            continue
+        if alive_only and not p["alive"]:
+            continue
+        status = "" if p["alive"] else " ☠️ (حذف شد)"
+        lines.append(f"{i}. {p['name']}{status}")
+    return "\n".join(lines) if lines else "کسی نیست."
+
+
+def mafia_resolve_target(game, arg: str):
+    arg = (arg or "").strip()
+    if not arg:
+        return None
+    order = game.get("order") or list(game["players"].keys())
+    if arg.isdigit():
+        idx = int(arg) - 1
+        if 0 <= idx < len(order):
+            guid = order[idx]
+            if game["players"][guid]["alive"]:
+                return guid
+        return None
+    for guid in order:
+        p = game["players"][guid]
+        if p["alive"] and arg in p["name"]:
+            return guid
+    return None
+
+
+def mafia_alive_players(game):
+    order = game.get("order") or list(game["players"].keys())
+    return [g for g in order if game["players"][g]["alive"]]
+
+
+def mafia_check_winner(game):
+    """برگردوندن 'مافیا' یا 'شهروندان' اگه بازی تموم شده باشه، وگرنه None."""
+    alive = mafia_alive_players(game)
+    mafia_alive = sum(1 for g in alive if game["players"][g]["role"] == MAFIA_ROLE_MAFIA)
+    others_alive = len(alive) - mafia_alive
+    if mafia_alive == 0:
+        return "شهروندان"
+    if mafia_alive >= others_alive:
+        return "مافیا"
+    return None
+
+
+def mafia_role_intro(game, guid: str) -> str:
+    p = game["players"][guid]
+    role = p["role"]
+    numbered = mafia_render_players(game)
+    if role == MAFIA_ROLE_MAFIA:
+        teammates = [
+            game["players"][g]["name"]
+            for g in game["order"]
+            if g != guid and game["players"][g]["role"] == MAFIA_ROLE_MAFIA
+        ]
+        team_txt = ("\nهم‌تیمی‌های مافیا: " + "، ".join(teammates)) if teammates else "\nتو تنها مافیای بازی هستی."
+        return (
+            f"🔪 نقش تو در بازی مافیا: مافیا\n"
+            f"هر شب با فرستادن «کشتن <شماره یا اسم>» یک نفر رو حذف کن.{team_txt}\n\n"
+            f"👥 لیست بازیکن‌ها:\n{numbered}"
+        )
+    if role == MAFIA_ROLE_DOCTOR:
+        return (
+            "💉 نقش تو در بازی مافیا: دکتر\n"
+            "هر شب با فرستادن «نجات <شماره یا اسم>» یک نفر (حتی خودت) رو از کشته‌شدن نجات بده.\n\n"
+            f"👥 لیست بازیکن‌ها:\n{numbered}"
+        )
+    if role == MAFIA_ROLE_DETECTIVE:
+        return (
+            "🕵️ نقش تو در بازی مافیا: کارآگاه\n"
+            "هر شب با فرستادن «بازرسی <شماره یا اسم>» هویت یک نفر رو بررسی کن؛ همون‌جا جواب رو بهت می‌گم.\n\n"
+            f"👥 لیست بازیکن‌ها:\n{numbered}"
+        )
+    return (
+        "🧑‍🌾 نقش تو در بازی مافیا: شهروند\n"
+        "شب‌ها کاری نداری. روزها با بحث تو گروه و «رای مافیا <شماره یا اسم>» سعی کن مافیا رو پیدا کنی.\n\n"
+        f"👥 لیست بازیکن‌ها:\n{numbered}"
+    )
+
+
+async def mafia_start_night(chat, game):
+    game["state"] = "night"
+    game["night_kill_target"] = None
+    game["night_save_target"] = None
+    game["day_votes"] = {}
+    alive_txt = mafia_render_players(game, alive_only=True)
+    await client.send_message(
+        chat,
+        f"🌙 شب {game['day_count']} فرا رسید.\n"
+        "مافیا/دکتر/کارآگاه اکشن شب‌شون رو تو پیوی خودشون با من می‌فرستن.\n"
+        f"وقتی همه اکشن دادن یا با «پایان شب» (فقط شروع‌کننده) خودم جمع‌بندی می‌کنم.\n\n"
+        f"👥 زنده‌ها:\n{alive_txt}",
+    )
+
+
+async def mafia_night_ready(game):
+    alive = mafia_alive_players(game)
+    mafia_alive = [g for g in alive if game["players"][g]["role"] == MAFIA_ROLE_MAFIA]
+    doctor_alive = [g for g in alive if game["players"][g]["role"] == MAFIA_ROLE_DOCTOR]
+    if mafia_alive and not game.get("night_kill_target"):
+        return False
+    if doctor_alive and not game.get("night_save_target"):
+        return False
+    return True
+
+
+async def mafia_resolve_night(chat, game):
+    kill = game.get("night_kill_target")
+    save = game.get("night_save_target")
+    lines = [f"☀️ نتیجه‌ی شب {game['day_count']}:"]
+    if kill and kill == save:
+        name = game["players"][kill]["name"]
+        lines.append(f"🛡 مافیا سراغ {name} رفت ولی دکتر نجاتش داد! امشب کسی نمرد.")
+    elif kill:
+        game["players"][kill]["alive"] = False
+        name = game["players"][kill]["name"]
+        role = game["players"][kill]["role"]
+        lines.append(f"💀 {name} امشب کشته شد. (نقش: {role})")
+    else:
+        lines.append("😶 امشب مافیا کسی رو انتخاب نکرد؛ کسی نمرد.")
+
+    winner = mafia_check_winner(game)
+    if winner:
+        lines.append(f"\n🏆 بازی تمام شد! برنده: {winner}")
+        lines.append("\nنقش همه:\n" + "\n".join(
+            f"{game['players'][g]['name']}: {game['players'][g]['role']}" for g in game["order"]
+        ))
+        await client.send_message(chat, "\n".join(lines))
+        del mafia_games[chat]
+        return
+
+    game["state"] = "voting"
+    game["day_votes"] = {}
+    alive_txt = mafia_render_players(game, alive_only=True)
+    lines.append(
+        "\n🗳 رای‌گیری روز باز شد. با «رای مافیا <شماره یا اسم>» به مشکوک‌ترین نفر رای بدید.\n"
+        f"وقتی همه رای دادن یا با «پایان رای گیری» (فقط شروع‌کننده) جمع‌بندی می‌کنم.\n\n"
+        f"👥 زنده‌ها:\n{alive_txt}"
+    )
+    await client.send_message(chat, "\n".join(lines))
+
+
+async def mafia_voting_ready(game):
+    alive = mafia_alive_players(game)
+    return all(g in game.get("day_votes", {}) for g in alive)
+
+
+async def mafia_tally_votes(chat, game):
+    counts = {}
+    for target in game.get("day_votes", {}).values():
+        counts[target] = counts.get(target, 0) + 1
+
+    lines = [f"🗳 نتیجه رای‌گیری روز {game['day_count']}:"]
+    if not counts:
+        lines.append("کسی رای نداد؛ امروز کسی اخراج نشد.")
+    else:
+        top = max(counts.values())
+        top_targets = [g for g, c in counts.items() if c == top]
+        for g, c in sorted(counts.items(), key=lambda kv: -kv[1]):
+            lines.append(f"{game['players'][g]['name']}: {c} رای")
+        if len(top_targets) > 1:
+            lines.append("\n🤝 رای‌ها مساوی شد؛ امروز کسی اخراج نشد.")
+        else:
+            out = top_targets[0]
+            game["players"][out]["alive"] = False
+            lines.append(f"\n❌ {game['players'][out]['name']} اخراج شد. (نقش: {game['players'][out]['role']})")
+
+    winner = mafia_check_winner(game)
+    if winner:
+        lines.append(f"\n🏆 بازی تمام شد! برنده: {winner}")
+        lines.append("\nنقش همه:\n" + "\n".join(
+            f"{game['players'][g]['name']}: {game['players'][g]['role']}" for g in game["order"]
+        ))
+        await client.send_message(chat, "\n".join(lines))
+        del mafia_games[chat]
+        return
+
+    game["day_count"] += 1
+    await client.send_message(chat, "\n".join(lines))
+    await mafia_start_night(chat, game)
+
+
+MAFIA_PANEL_TEXT = """🎭 پنل بازی مافیا
+
+🔹 راه‌اندازی (داخل گروه)
+مافیا شروع — باز کردن میز بازی
+پیوستن — ورود به بازی (وقتی میز بازه)
+مافیا لیست — دیدن بازیکن‌های فعلی
+مافیا خروج — انصراف قبل از شروع بازی
+مافیا شروع بازی — شروع رسمی (فقط شروع‌کننده)، حداقل {min} نفر
+مافیا لغو — لغو کامل بازی (شروع‌کننده)
+مافیا وضعیت — دیدن فاز فعلی بازی
+
+🔹 شب (فقط تو پیوی خودم با من)
+کشتن <شماره یا اسم> — فقط مافیا
+نجات <شماره یا اسم> — فقط دکتر
+بازرسی <شماره یا اسم> — فقط کارآگاه
+پایان شب — جمع‌بندی زودتر (فقط شروع‌کننده، تو گروه)
+
+🔹 روز (داخل گروه)
+رای مافیا <شماره یا اسم> — رای برای اخراج
+پایان رای گیری — جمع‌بندی زودتر (فقط شروع‌کننده)
+""".format(min=MAFIA_MIN_PLAYERS)
 
 
 def render_dooz(board):
@@ -337,6 +586,10 @@ HELP_TEXT = """📖 راهنمای ربات (نسخه‌ی روبیکا)
 🔹 امنیت
 سکوت روشن / سکوت خاموش
 افزودن ادمین <guid> / حذف ادمین <guid> / لیست ادمین‌ها
+
+🔹 بازی مافیا (داخل گروه)
+پنل مافیا — راهنمای کامل بازی مافیا
+مافیا شروع / پیوستن / مافیا لیست / مافیا شروع بازی / مافیا لغو / مافیا وضعیت
 
 🔹 بازی و سرگرمی
 تاس / سکه / سنگ کاغذ قیچی <سنگ|کاغذ|قیچی> / حدس عدد / چالش / جوک / فال
@@ -591,6 +844,218 @@ async def on_message(update):
         game["turn"] = game["players"][1] if sender == game["players"][0] else game["players"][0]
         await update.reply(msg + "\n\nنوبت نفر بعدیه.")
         return
+
+    # ---------- بازی مافیا ----------
+    # این بخش عمداً قبل از «گیت ادمین» گروه/پیوی قرار گرفته تا هم اعضای
+    # عادی گروه بتونن بپیوندن/رای بدن، هم اکشن‌های شب تو پیوی خودشون کار کنه.
+
+    if text == "پنل مافیا" or text == "راهنمای مافیا":
+        await update.reply(MAFIA_PANEL_TEXT)
+        return
+
+    if text == "مافیا شروع":
+        if not is_group_chat:
+            await update.reply("این بازی فقط داخل گروه قابل اجراست.")
+            return
+        if chat in mafia_games:
+            await update.reply("یک بازی مافیا از قبل تو این گروه بازه. برای دیدن بازیکن‌ها: مافیا لیست")
+            return
+        name = await mafia_get_name(sender)
+        mafia_games[chat] = {
+            "host": sender,
+            "state": "lobby",
+            "players": {sender: {"name": name, "role": None, "alive": True}},
+            "order": [],
+            "day_count": 0,
+            "night_kill_target": None,
+            "night_save_target": None,
+            "day_votes": {},
+        }
+        await update.reply(
+            f"🎭 میز بازی مافیا باز شد!\n{name} (شروع‌کننده) هم عضو بازیه.\n\n"
+            f"هرکس می‌خواد بازی کنه بنویسه: پیوستن\n"
+            f"حداقل {MAFIA_MIN_PLAYERS} نفر لازمه. وقتی آماده بودید، شروع‌کننده بنویسه: مافیا شروع بازی"
+        )
+        return
+
+    if text == "پیوستن":
+        game = mafia_games.get(chat)
+        if not game or game["state"] != "lobby":
+            return  # هیچ میز بازی‌ای باز نیست؛ این پیام مربوط به مافیا نیست
+        if sender in game["players"]:
+            await update.reply("شما قبلاً پیوستید.")
+            return
+        if len(game["players"]) >= MAFIA_MAX_PLAYERS:
+            await update.reply("ظرفیت بازی پره.")
+            return
+        name = await mafia_get_name(sender)
+        game["players"][sender] = {"name": name, "role": None, "alive": True}
+        await update.reply(f"✅ {name} به بازی پیوست. (تعداد فعلی: {len(game['players'])} نفر)")
+        return
+
+    if text == "مافیا خروج":
+        game = mafia_games.get(chat)
+        if not game or game["state"] != "lobby" or sender not in game["players"]:
+            return
+        if sender == game["host"]:
+            await update.reply("شروع‌کننده نمی‌تونه خارج بشه؛ به‌جاش می‌تونی «مافیا لغو» کنی.")
+            return
+        name = game["players"].pop(sender)["name"]
+        await update.reply(f"🚪 {name} از بازی خارج شد. (تعداد فعلی: {len(game['players'])} نفر)")
+        return
+
+    if text == "مافیا لیست":
+        game = mafia_games.get(chat)
+        if not game:
+            await update.reply("در حال حاضر بازی مافیایی باز نیست. برای شروع: مافیا شروع")
+            return
+        alive_only = game["state"] != "lobby"
+        await update.reply(f"👥 بازیکن‌های مافیا ({len(game['players'])} نفر):\n" + mafia_render_players(game, alive_only=alive_only))
+        return
+
+    if text == "مافیا لغو":
+        game = mafia_games.get(chat)
+        if not game:
+            return
+        if sender != game["host"] and not is_admin(sender):
+            await update.reply("فقط شروع‌کننده یا ادمین می‌تونه بازی رو لغو کنه.")
+            return
+        del mafia_games[chat]
+        await update.reply("🛑 بازی مافیا لغو شد.")
+        return
+
+    if text == "مافیا وضعیت":
+        game = mafia_games.get(chat)
+        if not game:
+            await update.reply("در حال حاضر بازی مافیایی باز نیست.")
+            return
+        state_fa = {
+            "lobby": "در حال جمع‌شدن بازیکن",
+            "night": f"شب {game['day_count']}",
+            "voting": f"رای‌گیری روز {game['day_count']}",
+        }.get(game["state"], game["state"])
+        await update.reply(f"وضعیت بازی مافیا: {state_fa}\nتعداد بازیکن‌ها: {len(game['players'])}")
+        return
+
+    if text == "مافیا شروع بازی":
+        game = mafia_games.get(chat)
+        if not game or game["state"] != "lobby":
+            await update.reply("میز بازی مافیایی برای شروع نیست. اول بنویس: مافیا شروع")
+            return
+        if sender != game["host"] and not is_admin(sender):
+            await update.reply("فقط شروع‌کننده می‌تونه بازی رو شروع کنه.")
+            return
+        n = len(game["players"])
+        if n < MAFIA_MIN_PLAYERS:
+            await update.reply(f"حداقل {MAFIA_MIN_PLAYERS} نفر لازمه، الان {n} نفر پیوستن.")
+            return
+        order = list(game["players"].keys())
+        roles = mafia_build_roles(n)
+        random.shuffle(order)
+        for guid, role in zip(order, roles):
+            game["players"][guid]["role"] = role
+        game["order"] = order
+        game["day_count"] = 1
+
+        failed_pv = []
+        for guid in order:
+            try:
+                await client.send_message(guid, mafia_role_intro(game, guid))
+            except Exception:
+                failed_pv.append(game["players"][guid]["name"])
+
+        msg = f"🎬 بازی مافیا با {n} نفر شروع شد! نقش‌ها تو پیوی هرکس فرستاده شد."
+        if failed_pv:
+            msg += (
+                "\n⚠️ نتونستم به این افراد پیوی بدم (شاید باید اول خودشون به من پیام بدن): "
+                + "، ".join(failed_pv)
+            )
+        await update.reply(msg)
+        await mafia_start_night(chat, game)
+        return
+
+    if text == "پایان شب":
+        game = mafia_games.get(chat)
+        if not game or game["state"] != "night":
+            return
+        if sender != game["host"] and not is_admin(sender):
+            await update.reply("فقط شروع‌کننده می‌تونه شب رو زودتر جمع‌بندی کنه.")
+            return
+        await mafia_resolve_night(chat, game)
+        return
+
+    if text.startswith("رای مافیا"):
+        game = mafia_games.get(chat)
+        if not game or game["state"] != "voting":
+            return
+        if sender not in game["players"] or not game["players"][sender]["alive"]:
+            return
+        arg = text.replace("رای مافیا", "", 1).strip()
+        target = mafia_resolve_target(game, arg)
+        if not target:
+            await update.reply("این شماره/اسم پیدا نشد. برای دیدن لیست: مافیا لیست")
+            return
+        game["day_votes"][sender] = target
+        await update.reply(f"🗳 رای شما برای {game['players'][target]['name']} ثبت شد.")
+        if await mafia_voting_ready(game):
+            await mafia_tally_votes(chat, game)
+        return
+
+    if text == "پایان رای گیری":
+        game = mafia_games.get(chat)
+        if not game or game["state"] != "voting":
+            return
+        if sender != game["host"] and not is_admin(sender):
+            await update.reply("فقط شروع‌کننده می‌تونه رای‌گیری رو زودتر جمع‌بندی کنه.")
+            return
+        await mafia_tally_votes(chat, game)
+        return
+
+    # ---------- اکشن‌های شب مافیا (فقط تو پیوی خود بازیکن با من) ----------
+    if not is_group_chat and text.startswith(("کشتن", "نجات", "بازرسی")):
+        target_game = None
+        target_chat = None
+        for g_chat, g in mafia_games.items():
+            if g["state"] == "night" and sender in g["players"] and g["players"][sender]["alive"]:
+                target_game = g
+                target_chat = g_chat
+                break
+        if target_game:
+            role = target_game["players"][sender]["role"]
+            if text.startswith("کشتن") and role == MAFIA_ROLE_MAFIA:
+                arg = text.replace("کشتن", "", 1).strip()
+                dest = mafia_resolve_target(target_game, arg)
+                if not dest:
+                    await update.reply("این شماره/اسم پیدا نشد.")
+                    return
+                target_game["night_kill_target"] = dest
+                await update.reply(f"🎯 هدف امشب: {target_game['players'][dest]['name']}")
+                if await mafia_night_ready(target_game):
+                    await mafia_resolve_night(target_chat, target_game)
+                return
+            if text.startswith("نجات") and role == MAFIA_ROLE_DOCTOR:
+                arg = text.replace("نجات", "", 1).strip()
+                dest = mafia_resolve_target(target_game, arg)
+                if not dest:
+                    await update.reply("این شماره/اسم پیدا نشد.")
+                    return
+                target_game["night_save_target"] = dest
+                await update.reply(f"💉 امشب مراقب {target_game['players'][dest]['name']} هستی.")
+                if await mafia_night_ready(target_game):
+                    await mafia_resolve_night(target_chat, target_game)
+                return
+            if text.startswith("بازرسی") and role == MAFIA_ROLE_DETECTIVE:
+                arg = text.replace("بازرسی", "", 1).strip()
+                dest = mafia_resolve_target(target_game, arg)
+                if not dest:
+                    await update.reply("این شماره/اسم پیدا نشد.")
+                    return
+                is_mafia = target_game["players"][dest]["role"] == MAFIA_ROLE_MAFIA
+                await update.reply(
+                    f"🕵️ نتیجه بازرسی {target_game['players'][dest]['name']}: "
+                    + ("مافیا هست 😈" if is_mafia else "مافیا نیست 🙂")
+                )
+                return
 
     # ---------- دیباگ موقت: نشان‌دادن فیلدهای واقعی آبجکت update ----------
     # (بعد از حل شدن مشکل «ثبت بنر»، این بلوک را می‌توانید حذف کنید)
